@@ -2,29 +2,87 @@ mod tm1637;
 mod wifi;
 
 use std::{thread, time::Duration};
+use std::rc::Rc;
+use core::cell::RefCell;
 
 use anyhow::Result;
-use chrono::{Local, Timelike};
 use esp_idf_hal::{
     delay::FreeRtos,
-    gpio::{PinDriver, Pull},
     i2c::{I2cConfig, I2cDriver},
     prelude::Peripherals,
-    sys::{esp_timer_get_time, tzset},
+    units::FromValueType,
 };
 use esp_idf_svc::{
     eventloop::EspSystemEventLoop,
-    mqtt::client::{EspMqttClient, MqttClientConfiguration, MqttProtocolVersion, QoS},
     nvs::EspDefaultNvsPartition,
-    sntp::{EspSntp, SyncStatus},
 };
-use log::{info, warn};
-use shtcx::PowerMode;
-use tm1637::TM1637;
-use wifi::{connect_wifi, WifiConfig};
+use log::info;
 
-// 导入 DelayNs trait 以使用 delay_us
-use embedded_hal::delay::DelayNs;
+// OLED 相关库
+use ssd1306::{prelude::*, I2CDisplayInterface, Ssd1306};
+use embedded_graphics::{
+    mono_font::{ascii::FONT_6X10, MonoTextStyle},
+    pixelcolor::BinaryColor,
+    prelude::*,
+    text::{Text, Alignment},
+};
+
+// 温湿度传感器库
+use shtcx::{self, PowerMode};
+
+// 引入不同版本的 embedded-hal traits
+use embedded_hal::i2c::I2c as I2c1;         // ehal 1.0
+use embedded_hal_02::blocking::i2c::Write as I2c0Write; // ehal 0.2
+
+// 自定义共享 I2C 包装器，使用 Rc 共享所有权
+struct SharedI2c(Rc<RefCell<I2cDriver<'static>>>); // 注意：'static 实际上是针对 Rc 内部数据的，但 I2cDriver 的实际生命周期由 Rc 管理
+
+// 实现 ehal 1.0 的 ErrorType
+impl embedded_hal::i2c::ErrorType for SharedI2c {
+    type Error = <I2cDriver<'static> as embedded_hal::i2c::ErrorType>::Error;
+}
+
+// 实现 ehal 1.0 的 I2c trait（用于 shtcx）
+impl I2c1 for SharedI2c {
+    fn read(&mut self, address: u8, buffer: &mut [u8]) -> Result<(), Self::Error> {
+        let mut driver = self.0.borrow_mut();
+        I2c1::read(&mut *driver, address, buffer)
+    }
+
+    fn write(&mut self, address: u8, bytes: &[u8]) -> Result<(), Self::Error> {
+        let mut driver = self.0.borrow_mut();
+        I2c1::write(&mut *driver, address, bytes)
+    }
+
+    fn write_read(
+        &mut self,
+        address: u8,
+        bytes: &[u8],
+        buffer: &mut [u8],
+    ) -> Result<(), Self::Error> {
+        let mut driver = self.0.borrow_mut();
+        I2c1::write_read(&mut *driver, address, bytes, buffer)
+    }
+
+    fn transaction(
+        &mut self,
+        address: u8,
+        operations: &mut [embedded_hal::i2c::Operation<'_>],
+    ) -> Result<(), Self::Error> {
+        let mut driver = self.0.borrow_mut();
+        I2c1::transaction(&mut *driver, address, operations)
+    }
+}
+
+// 实现 ehal 0.2 的 blocking::i2c::Write（用于 ssd1306）
+impl I2c0Write for SharedI2c {
+    type Error = <I2cDriver<'static> as I2c0Write>::Error;
+
+    fn write(&mut self, addr: u8, bytes: &[u8]) -> Result<(), Self::Error> {
+        let mut driver = self.0.borrow_mut();
+        I2c0Write::write(&mut *driver, addr, bytes)
+    }
+}
 
 fn main() -> Result<()> {
     esp_idf_svc::sys::link_patches();
@@ -32,155 +90,69 @@ fn main() -> Result<()> {
 
     // --- 外设初始化 ---
     let peripherals = Peripherals::take().unwrap();
-    let sysloop = EspSystemEventLoop::take()?;
-    let nvs = EspDefaultNvsPartition::take()?;
+    let _sysloop = EspSystemEventLoop::take()?; // 如果不使用 Wi-Fi，可以忽略
+    let _nvs = EspDefaultNvsPartition::take()?; // 如果不使用 NVS，可以忽略
 
-    // 数码管
-    let mut tm = TM1637::new(peripherals.pins.gpio8, peripherals.pins.gpio9);
-    tm.set_brightness(7);
-    tm.display_digits(&[0, 0, 0, 0]);
-
-    // Wi-Fi 配置
-    let wifi_config = WifiConfig {
-        ssid: "ChinaNet-V2QP樊平军",
-        password: "88888888",
-        auth_method: esp_idf_svc::wifi::AuthMethod::WPA2Personal,
-    };
-
-    info!("Connecting to Wi-Fi...");
-    let _connection = match connect_wifi(&wifi_config, peripherals.modem, sysloop, nvs) {
-        Ok(conn) => {
-            info!("Wi-Fi connected! IP: {}", conn.ip_info);
-            conn
-        }
-        Err(e) => {
-            log::error!("Failed to connect Wi-Fi: {}", e);
-            return Err(e);
-        }
-    };
-    use esp_idf_hal::prelude::FromValueType;
-
-    // 温湿度传感器 (I2C)
-    let sda = peripherals.pins.gpio4;
-    let scl = peripherals.pins.gpio5;
+    // --- 初始化 I2C 总线 (GPIO8=SDA, GPIO9=SCL) ---
+    let sda = peripherals.pins.gpio8;
+    let scl = peripherals.pins.gpio9;
     let config = I2cConfig::new().baudrate(400u32.kHz().into());
-    let i2c = I2cDriver::new(peripherals.i2c0, sda, scl, &config)?;
-    let mut sht = shtcx::shtc3(i2c);
+    let i2c_driver = I2cDriver::new(peripherals.i2c0, sda, scl, &config)?;
+
+    // 将 I2cDriver 放入 Rc<RefCell> 中，实现共享所有权
+    let i2c_rc = Rc::new(RefCell::new(i2c_driver));
+
+    // --- 温湿度传感器 SHTC3 ---
+    let sht_i2c = SharedI2c(i2c_rc.clone());
+    let mut sht = shtcx::shtc3(sht_i2c);
     let device_id = sht.device_identifier().unwrap();
-    info!("Device ID SHTC3: {:#02x}", device_id);
+    info!("SHTC3 device ID: {:#02x}", device_id);
 
-    // --- 超声波传感器 (HC-SR04P) 初始化 ---
-   let mut trig = PinDriver::output(peripherals.pins.gpio6)?;
-    let mut echo = PinDriver::input(peripherals.pins.gpio7)?;
-    echo.set_pull(Pull::Down)?;
+    // --- OLED 显示屏 (0.96寸, SSD1306) ---
+    let oled_i2c = SharedI2c(i2c_rc.clone());
+    let interface = I2CDisplayInterface::new(oled_i2c);
+    let mut display = Ssd1306::new(interface, DisplaySize128x64, DisplayRotation::Rotate0)
+        .into_buffered_graphics_mode();
 
-    // NTP 时间同步
-    let ntp = EspSntp::new_default().unwrap();
-    println!("Synchronizing with NTP Server");
-    while ntp.get_sync_status() != SyncStatus::Completed {}
-    println!("Time Sync Completed");
-    unsafe {
-        libc::setenv(c"TZ".as_ptr(), c"CST-8".as_ptr(), 1);
-        tzset();
-    }
+    // 初始化 OLED（注意 DisplayError 未实现 std::error::Error，需手动转换）
+    display.init().map_err(|e| anyhow::anyhow!("OLED init error: {:?}", e))?;
+    display.clear(BinaryColor::Off).map_err(|e| anyhow::anyhow!("OLED clear error: {:?}", e))?;
+    display.flush().map_err(|e| anyhow::anyhow!("OLED flush error: {:?}", e))?;
+    info!("OLED initialized");
 
-    // MQTT 配置
-    let mqtt_config = MqttClientConfiguration {
-        client_id: Some("mqtt_f89f5814-f4e"),
-        username: Some("a5ad6337-186f-13d8-f2f"),
-        protocol_version: Some(MqttProtocolVersion::V3_1_1),
-        network_timeout: Duration::from_secs(10),
-        keep_alive_interval: Some(Duration::from_secs(60)),
-        ..Default::default()
-    };
-    let broker_url = "mqtt://192.168.2.94";
-    use esp_idf_svc::mqtt::client::EventPayload::{Error, Received};
-    let mut client =
-        EspMqttClient::new_cb(
-            &broker_url,
-            &mqtt_config,
-            |message_event| match message_event.payload() {
-                Received { data, details, .. } => {
-                    info!("Received from MQTT: {:?}", data);
-                    info!("Received from MQTT: {:?}", details);
-                }
-                Error(e) => warn!("Received error from MQTT: {:?}", e),
-                _ => info!("Received from MQTT: {:?}", message_event.payload()),
-            },
-        )?;
+    // 定义文本样式
+    let text_style = MonoTextStyle::new(&FONT_6X10, BinaryColor::On);
 
     // --- 主循环 ---
-    let mut colon_state = false;
-    let mut delay = FreeRtos;
     loop {
-        info!("Sending trigger");
-        trig.set_high()?;
-        delay.delay_us(15);   // 使用延时对象
-        trig.set_low()?;
-
-        let timeout_us = 100_000;
-        let start_wait = unsafe { esp_timer_get_time() };
-        while echo.is_low() {
-            let now = unsafe { esp_timer_get_time() };
-            if (now - start_wait) > timeout_us {
-                info!("Echo timeout (no pulse)");
-                break;
-            }
-        }
-
-        if echo.is_high() {
-            let pulse_start = unsafe { esp_timer_get_time() };
-            while echo.is_high() {
-                let now = unsafe { esp_timer_get_time() };
-                if (now - pulse_start) > timeout_us {
-                    info!("Pulse too long");
-                    break;
-                }
-            }
-            let pulse_end = unsafe { esp_timer_get_time() };
-            let pulse_width = pulse_end - pulse_start;
-
-            if pulse_width > 0 && pulse_width < timeout_us {
-                let distance_cm = (pulse_width as f32) * 0.034 / 2.0;
-                info!("Distance: {:.1} cm", distance_cm);
-            } else {
-                info!("Invalid width: {} µs", pulse_width);
-            }
-        }
-
-        FreeRtos::delay_ms(500);
-
-        // ========== 2. 温湿度采集 & MQTT 发布 ==========
-        println!("[6] Reading temperature and humidity");
+        // 触发温湿度测量
         sht.start_measurement(PowerMode::NormalMode).unwrap();
-        FreeRtos::delay_ms(100);
+        FreeRtos::delay_ms(100); // 等待测量完成
         let measurement = sht.get_measurement_result().unwrap();
 
-        #[derive(serde::Serialize)]
-        struct CurrentMeasurement {
-            current_temperature: f32,
-            current_humidity: f32,
-        }
-        let payload = CurrentMeasurement {
-            current_temperature: measurement.temperature.as_degrees_celsius(),
-            current_humidity: measurement.humidity.as_percent(),
-        };
-        let payload = serde_json::to_string(&payload).unwrap();
-        let topic = "devices/telemetry".to_string();
+        let temp = measurement.temperature.as_degrees_celsius();
+        let hum = measurement.humidity.as_percent();
 
-        println!("[7] Publishing MQTT: {}", payload);
-        client.publish(&topic, QoS::AtMostOnce, false, payload.as_bytes())?;
+        info!("Temp: {:.1} °C, Hum: {:.1} %", temp, hum);
 
-        // ========== 3. 数码管显示时间 ==========
-        println!("[8] Updating display");
-        let now = Local::now();
-        let hour = now.hour() as u8;
-        let minute = now.minute() as u8;
-        let digits = [hour / 10, hour % 10, minute / 10, minute % 10];
-        colon_state = !colon_state;
-        tm.display_time(&digits, colon_state);
+        // 在 OLED 上显示
+        display.clear(BinaryColor::Off)
+            .map_err(|e| anyhow::anyhow!("OLED clear error: {:?}", e))?;
 
-        println!("[9] Sleeping 1 second");
-        std::thread::sleep(Duration::from_secs(1));
+        let temp_str = format!("Temp: {:.1}C", temp);
+        Text::with_alignment(&temp_str, Point::new(64, 28), text_style, Alignment::Center)
+            .draw(&mut display)
+            .map_err(|e| anyhow::anyhow!("OLED draw error: {:?}", e))?;
+
+        let hum_str = format!("Hum: {:.1}%", hum);
+        Text::with_alignment(&hum_str, Point::new(64, 44), text_style, Alignment::Center)
+            .draw(&mut display)
+            .map_err(|e| anyhow::anyhow!("OLED draw error: {:?}", e))?;
+
+        display.flush()
+            .map_err(|e| anyhow::anyhow!("OLED flush error: {:?}", e))?;
+
+        // 每秒更新一次
+        thread::sleep(Duration::from_secs(1));
     }
 }

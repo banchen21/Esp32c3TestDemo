@@ -26,6 +26,7 @@ experimental = ["esp-idf-svc/experimental"]
 anyhow = "1.0"
 chrono = "0.4.43"
 embedded-hal = "1.0.0"
+embedded-hal-02 = { package = "embedded-hal", version = "0.2" }
 esp-idf-hal = "0.45"
 esp-idf-svc = "0.51"
 libc = "0.2.182"
@@ -34,6 +35,8 @@ serde = "1.0.228"
 serde_json = "1.0.149"
 shtcx = "1.0.0"
 toml-cfg = "0.2.0"
+ssd1306 = "0.8"
+embedded-graphics = "0.8"
 
 [build-dependencies]
 embuild = "0.33"
