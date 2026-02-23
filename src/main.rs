@@ -1,9 +1,9 @@
 mod tm1637;
 mod wifi;
 
-use std::{thread, time::Duration};
-use std::rc::Rc;
 use core::cell::RefCell;
+use std::rc::Rc;
+use std::{thread, time::Duration};
 
 use anyhow::Result;
 use esp_idf_hal::{
@@ -12,26 +12,24 @@ use esp_idf_hal::{
     prelude::Peripherals,
     units::FromValueType,
 };
-use esp_idf_svc::{
-    eventloop::EspSystemEventLoop,
-    nvs::EspDefaultNvsPartition,
-};
+use esp_idf_svc::{eventloop::EspSystemEventLoop, nvs::EspDefaultNvsPartition};
 use log::info;
 
 // OLED 相关库
-use ssd1306::{prelude::*, I2CDisplayInterface, Ssd1306};
+use embedded_graphics::mono_font::iso_8859_1::FONT_6X10;
 use embedded_graphics::{
-    mono_font::{ascii::FONT_6X10, MonoTextStyle},
+    mono_font::MonoTextStyle,
     pixelcolor::BinaryColor,
     prelude::*,
-    text::{Text, Alignment},
+    text::{Alignment, Text},
 };
+use ssd1306::{prelude::*, I2CDisplayInterface, Ssd1306};
 
 // 温湿度传感器库
 use shtcx::{self, PowerMode};
 
 // 引入不同版本的 embedded-hal traits
-use embedded_hal::i2c::I2c as I2c1;         // ehal 1.0
+use embedded_hal::i2c::I2c as I2c1; // ehal 1.0
 use embedded_hal_02::blocking::i2c::Write as I2c0Write; // ehal 0.2
 
 // 自定义共享 I2C 包装器，使用 Rc 共享所有权
@@ -115,9 +113,15 @@ fn main() -> Result<()> {
         .into_buffered_graphics_mode();
 
     // 初始化 OLED（注意 DisplayError 未实现 std::error::Error，需手动转换）
-    display.init().map_err(|e| anyhow::anyhow!("OLED init error: {:?}", e))?;
-    display.clear(BinaryColor::Off).map_err(|e| anyhow::anyhow!("OLED clear error: {:?}", e))?;
-    display.flush().map_err(|e| anyhow::anyhow!("OLED flush error: {:?}", e))?;
+    display
+        .init()
+        .map_err(|e| anyhow::anyhow!("OLED init error: {:?}", e))?;
+    display
+        .clear(BinaryColor::Off)
+        .map_err(|e| anyhow::anyhow!("OLED clear error: {:?}", e))?;
+    display
+        .flush()
+        .map_err(|e| anyhow::anyhow!("OLED flush error: {:?}", e))?;
     info!("OLED initialized");
 
     // 定义文本样式
@@ -136,10 +140,11 @@ fn main() -> Result<()> {
         info!("Temp: {:.1} °C, Hum: {:.1} %", temp, hum);
 
         // 在 OLED 上显示
-        display.clear(BinaryColor::Off)
+        display
+            .clear(BinaryColor::Off)
             .map_err(|e| anyhow::anyhow!("OLED clear error: {:?}", e))?;
 
-        let temp_str = format!("Temp: {:.1}C", temp);
+        let temp_str = format!("Temp: {:.1}°C", temp);
         Text::with_alignment(&temp_str, Point::new(64, 28), text_style, Alignment::Center)
             .draw(&mut display)
             .map_err(|e| anyhow::anyhow!("OLED draw error: {:?}", e))?;
@@ -149,7 +154,8 @@ fn main() -> Result<()> {
             .draw(&mut display)
             .map_err(|e| anyhow::anyhow!("OLED draw error: {:?}", e))?;
 
-        display.flush()
+        display
+            .flush()
             .map_err(|e| anyhow::anyhow!("OLED flush error: {:?}", e))?;
 
         // 每秒更新一次
